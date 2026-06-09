@@ -1960,4 +1960,5 @@ def main():
         generate_training_video(all_metrics, teams_to_train, video_path)
 
 
-main()
+if __name__ == "__main__":
+    main()

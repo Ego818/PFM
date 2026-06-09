@@ -74,46 +74,56 @@ from scipy.ndimage import convolve
 
 
 # ============================================================
-# API mínima tipo Gymnasium (sin dependencia externa)
+# API Gymnasium — usa gymnasium real si está disponible (necesario para SB3),
+# cae a implementación mínima standalone si no está instalado.
 # ============================================================
 
-class Space:
-    def sample(self): raise NotImplementedError
-    def contains(self, x) -> bool: raise NotImplementedError
+try:
+    import gymnasium as _gym
+    Box      = _gym.spaces.Box
+    Discrete = _gym.spaces.Discrete
+    Env      = _gym.Env
+    _GYM_AVAILABLE = True
+except ImportError:
+    _GYM_AVAILABLE = False
 
-class Box(Space):
-    def __init__(self, low, high, shape, dtype=np.float32):
-        self.low = np.full(shape, low, dtype=dtype)
-        self.high = np.full(shape, high, dtype=dtype)
-        self.shape = shape
-        self.dtype = dtype
-    def sample(self):
-        return np.random.uniform(self.low, self.high).astype(self.dtype)
-    def contains(self, x):
-        x = np.asarray(x)
-        return x.shape == self.shape and np.all(x >= self.low) and np.all(x <= self.high)
-    def __repr__(self):
-        return f"Box(shape={self.shape}, dtype={self.dtype})"
+    class Space:
+        def sample(self): raise NotImplementedError
+        def contains(self, x) -> bool: raise NotImplementedError
 
-class Discrete(Space):
-    def __init__(self, n):
-        self.n = n
-    def sample(self):
-        return int(np.random.randint(0, self.n))
-    def contains(self, x):
-        return isinstance(x, (int, np.integer)) and 0 <= int(x) < self.n
-    def __repr__(self):
-        return f"Discrete({self.n})"
+    class Box(Space):
+        def __init__(self, low, high, shape, dtype=np.float32):
+            self.low   = np.full(shape, low,  dtype=dtype)
+            self.high  = np.full(shape, high, dtype=dtype)
+            self.shape = shape
+            self.dtype = dtype
+        def sample(self):
+            return np.random.uniform(self.low, self.high).astype(self.dtype)
+        def contains(self, x):
+            x = np.asarray(x)
+            return x.shape == self.shape and np.all(x >= self.low) and np.all(x <= self.high)
+        def __repr__(self):
+            return f"Box(shape={self.shape}, dtype={self.dtype})"
 
-class Env:
-    observation_space: Space = None
-    action_space: Space = None
-    metadata: dict = {}
-    render_mode: Optional[str] = None
-    def reset(self, *, seed=None, options=None): raise NotImplementedError
-    def step(self, action): raise NotImplementedError
-    def render(self): pass
-    def close(self): pass
+    class Discrete(Space):
+        def __init__(self, n):
+            self.n = n
+        def sample(self):
+            return int(np.random.randint(0, self.n))
+        def contains(self, x):
+            return isinstance(x, (int, np.integer)) and 0 <= int(x) < self.n
+        def __repr__(self):
+            return f"Discrete({self.n})"
+
+    class Env:
+        observation_space: Space = None
+        action_space:      Space = None
+        metadata:   dict = {}
+        render_mode: Optional[str] = None
+        def reset(self, *, seed=None, options=None): raise NotImplementedError
+        def step(self, action): raise NotImplementedError
+        def render(self): pass
+        def close(self): pass
 
 
 # ============================================================
@@ -333,8 +343,12 @@ class MARLExploration3D(Env):
     info["team_spread"]          distancia media entre pares de agentes
     """
 
-    def __init__(self, config: Optional[ExplorationConfig] = None):
+    # gymnasium.Env requiere render_mode en __init__
+    metadata = {"render_modes": ["ansi"]}
+
+    def __init__(self, config: Optional[ExplorationConfig] = None, render_mode: Optional[str] = None):
         self.cfg = config or ExplorationConfig()
+        self.render_mode = render_mode
         self._base_rng = np.random.default_rng(self.cfg.seed)
 
         self.n_agents  = self.cfg.n_agents
@@ -343,19 +357,26 @@ class MARLExploration3D(Env):
         self.F         = self.cfg.n_floors
         self.n_actions = N_ACTIONS
 
-        # Dimensión de observación (calculada una vez)
+        # Dimensión de observación — debe coincidir EXACTAMENTE con _build_obs:
+        #   cell_obs   : (2r+1)² floats  — tipo de celda local
+        #   visit_obs  : (2r+1)² floats  — mapa de visita local
+        #   self_obs   : 7 floats        — [floor_n, r_n, c_n, cov, step_n, dir_r, dir_c]
+        #   other_obs  : (n_agents-1)×5  — compacto: solo los OTROS agentes
+        #   msg_obs    : msg_dim floats  — solo si comm_mode="explicit"
         r = self.cfg.obs_radius
         view_cells = (2*r+1)**2
         self.obs_dim = (
-            view_cells       # tipo de celda local
-            + view_cells     # mapa de visita local
-            + 5              # [floor_n, r_n, c_n, global_cov, step_n]
-            + self.n_agents * 5  # otros agentes [df,dr,dc,cov_norm,in_range]
+            view_cells               # tipo de celda local
+            + view_cells             # mapa de visita local
+            + 7                      # self_obs con brújula de frontera (dir_r, dir_c)
+            + (self.n_agents - 1) * 5  # OTROS agentes (no incluye al propio agente)
             + (self.cfg.msg_dim if self.cfg.comm_mode == "explicit" else 0)
         )
 
-        self.observation_space = Box(0.0, 1.0, shape=(self.obs_dim,))
-        self.action_space      = Discrete(N_ACTIONS)
+        self.observation_space = Box(
+            low=-np.inf, high=np.inf, shape=(self.obs_dim,), dtype=np.float32
+        )
+        self.action_space = Discrete(N_ACTIONS)
 
         # Estado del entorno (se inicializa en reset)
         self.floors:       np.ndarray = None   # (F, H, W) int32
@@ -476,6 +497,8 @@ class MARLExploration3D(Env):
         new_r = self.agent_r.copy()
         new_c = self.agent_c.copy()
 
+        collisions = [False] * n
+
         for i in range(n):
             a = int(act[i])
             f, r, c = int(self.agent_f[i]), int(self.agent_r[i]), int(self.agent_c[i])
@@ -488,18 +511,26 @@ class MARLExploration3D(Env):
                     new_r[i], new_c[i] = nr, nc
                 else:
                     rew[i] += self.cfg.reward_wall
+                    collisions[i] = True
 
             elif a == int(Action.ESC_SUBIR):
                 if (f, r, c) in self._su_set and f + 1 < self.F:
                     new_f[i] = f + 1
                 else:
                     rew[i] += self.cfg.reward_wall * 0.5
+                    collisions[i] = True
 
             elif a == int(Action.ESC_BAJAR):
                 if (f, r, c) in self._sd_set and f > 0:
                     new_f[i] = f - 1
                 else:
                     rew[i] += self.cfg.reward_wall * 0.5
+                    collisions[i] = True
+            
+            # 🚀 PARCHE CRÍTICO: Si el agente elige una acción de mensaje o inválida y no intenta moverse,
+            # se le aplica una penalización directa por inactividad física para romper el óptimo local.
+            else:
+                rew[i] += -0.2  
 
         # 3. Resolver colisiones entre agentes
         new_f, new_r, new_c = self._resolve_collisions(new_f, new_r, new_c)
@@ -511,43 +542,51 @@ class MARLExploration3D(Env):
 
         # 5. Recompensas de exploración
         prev_visited = self._cells_visited
+        new_cells_by_agent = np.zeros(n, dtype=np.float64)
+
         for i in range(n):
             f, r, c = int(new_f[i]), int(new_r[i]), int(new_c[i])
             if not self.visited[f, r, c]:
                 self.visited[f, r, c] = True
                 self._cells_visited += 1
                 self._agent_new_cells[i] += 1
-                rew[i] += self.cfg.reward_new_cell
+                new_cells_by_agent[i] = 1.0
+                # Solo sumamos al rew individual local si el modo no es puramente compartido
+                if self.cfg.reward_mode != "shared":
+                    rew[i] += self.cfg.reward_new_cell
             else:
+                # Castigo por pisar baldosa repetida o haberse chocado/quedado quieto
                 rew[i] += self.cfg.reward_redundant
                 self._redundant_steps += 1
 
-        # 6. Penalización por paso
+        # 6. Penalización básica por paso
         rew += self.cfg.reward_step
 
         # 7. Hitos de cobertura
         cov = self.coverage_ratio
         self._check_milestones()
 
-        # 8. Bonus de completado
+        # 8. Bonus de completado (Repartido equitativamente si se llega al 100%)
         if cov >= self.cfg.coverage_target:
             bonus = self.cfg.reward_completion / n
             rew += bonus
 
-        # 9. Recompensa de equipo
+        # 9. Recompensa de equipo limpia
         new_cells_this_step = self._cells_visited - prev_visited
-        team_rew = new_cells_this_step * self.cfg.reward_new_cell / n
+        team_rew = (new_cells_this_step * self.cfg.reward_new_cell) / n
 
-        # 10. Esquema de recompensa
+        # 10. Esquema de recompensa reparado (Evita la duplicación matemática)
         if self.cfg.reward_mode == "shared":
-            rew[:] = team_rew + self.cfg.reward_step
+            # En modo compartido, todos reciben la recompensa colectiva limpia + penalizaciones individuales por choque
+            rew[:] = team_rew + self.cfg.reward_step + (rew - self.cfg.reward_step)
         elif self.cfg.reward_mode == "mixed":
-            a = self.cfg.reward_alpha
-            rew = a * rew + (1 - a) * (team_rew + self.cfg.reward_step)
+            alpha = self.cfg.reward_alpha
+            # Se combina el mérito individual con el avance colectivo de forma balanceada
+            rew = alpha * rew + (1.0 - alpha) * (team_rew + self.cfg.reward_step)
 
         # 11. Terminación
-        terminated = cov >= self.cfg.coverage_target
-        truncated  = self.step_count >= self.cfg.max_steps
+        terminated = bool(cov >= self.cfg.coverage_target)
+        truncated  = bool(self.step_count >= self.cfg.max_steps)
 
         return (
             self._get_all_obs(),
@@ -556,6 +595,7 @@ class MARLExploration3D(Env):
             truncated,
             self._get_info(),
         )
+
 
     def render(self, floor: int = 0, view_size: int = 35) -> str:
         """
@@ -690,19 +730,40 @@ class MARLExploration3D(Env):
                              _CELL_OBS[np.clip(cell_patch, 0, N_CELL_TYPES-1)]).flatten().astype(np.float32)
         visit_obs = visit_patch.flatten()
 
-        # --- Estado propio ---
+        # 🚀 INYECCIÓN CRÍTICA: Radar de Frontera inexplorada
+        # Buscamos las coordenadas de todas las celdas libres que sigan sin visitarse en esta planta
+       # Buscamos las celdas libres que queden sin visitar en esta planta específica
+        unvisited_cells = np.argwhere((self.floors[f] != PARED) & (self.visited[f] == False))
+        
+        if len(unvisited_cells) > 0:
+            # Distancia Manhattan hacia la celda libre más cercana del mapa actual
+            dists = np.abs(unvisited_cells[:, 0] - r) + np.abs(unvisited_cells[:, 1] - c)
+            closest_idx = np.argmin(dists)
+            target_r, target_c = unvisited_cells[closest_idx, 0], unvisited_cells[closest_idx, 1]
+            
+            # Dirección cardinal pura: indica hacia dónde caminar
+            dir_r = float(np.sign(target_r - r))
+            dir_c = float(np.sign(target_c - c))
+        else:
+            dir_r, dir_c = 0.0, 0.0
+
+        # --- Estado propio (Actualizado con el Radar) ---
         self_obs = np.array([
             f / max(1, self.F - 1),
             r / self.H,
             c / self.W,
             self.coverage_ratio,
             self.step_count / self.cfg.max_steps,
+            dir_r,  # 🚀 Brújula de exploración: dirección de filas hacia lo desconocido
+            dir_c   # 🚀 Brújula de exploración: dirección de columnas hacia lo desconocido
         ], dtype=np.float32)
 
-        # --- Otros agentes (en rango de comunicación) ---
-        other_obs = np.zeros(self.n_agents * 5, dtype=np.float32)
+        # --- Otros agentes (Compactado simétricamente a n_agents - 1) ---
+        other_list = []
         for j in range(self.n_agents):
-            if j == i: continue
+            if j == i: 
+                continue  # Saltamos limpiamente sin dejar huecos asimétricos de ceros
+                
             df = int(self.agent_f[j]) - f
             dr = int(self.agent_r[j]) - r
             dc = int(self.agent_c[j]) - c
@@ -713,12 +774,17 @@ class MARLExploration3D(Env):
             ) or (abs(dr) <= rad and abs(dc) <= rad and df == 0)
 
             if in_range:
-                k = j * 5
-                other_obs[k]   = df / self.F
-                other_obs[k+1] = dr / self.H
-                other_obs[k+2] = dc / self.W
-                other_obs[k+3] = self._agent_new_cells[j] / max(1, self._n_free)
-                other_obs[k+4] = 1.0  # en rango
+                other_list.extend([
+                    df / self.F,
+                    dr / self.H,
+                    dc / self.W,
+                    self._agent_new_cells[j] / max(1, self._n_free),
+                    1.0  # en rango
+                ])
+            else:
+                other_list.extend([0.0, 0.0, 0.0, 0.0, 0.0])
+                
+        other_obs = np.array(other_list, dtype=np.float32)
 
         # --- Mensaje recibido ---
         msg_obs = (self.agent_msgs[i].copy()
@@ -726,6 +792,7 @@ class MARLExploration3D(Env):
                    else np.zeros(0, dtype=np.float32))
 
         return np.concatenate([cell_obs, visit_obs, self_obs, other_obs, msg_obs])
+
 
     # ----------------------------------------------------------
     # Comunicación explícita
