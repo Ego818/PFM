@@ -89,41 +89,32 @@ ESCALERA_BAJAR = 3
 # BÚSQUEDA DE CHECKPOINTS
 # ──────────────────────────────────────────────────────────────
 
-def _find_best_checkpoint(ckpt_dir: Path, team_id: int) -> Optional[Tuple[int, Path]]:
-    """
-    Devuelve (phase_idx, path) del checkpoint más avanzado para el equipo,
-    o None si no existe ninguno.
-    """
-    best_phase: Optional[int] = None
-    best_path:  Optional[Path] = None
-
-    for phase in CURRICULUM:
-        p = ckpt_dir / f"model_team{team_id}_phase{phase.idx}.zip"
-        if p.exists():
-            best_phase = phase.idx
-            best_path  = p
-
-    if best_phase is None:
-        return None
-    return best_phase, best_path
-
-
-def _find_checkpoint(
+def _find_all_checkpoints(
     ckpt_dir: Path,
     team_id:  int,
-    phase_id: Optional[int],
-) -> Optional[Tuple[int, Path]]:
+    phase_id: Optional[int] = None,
+) -> List[Tuple[int, Path]]:
     """
-    Si phase_id está fijado, busca ese checkpoint concreto.
-    Si no, devuelve el más avanzado disponible.
+    Devuelve la lista de (phase_idx, path) de todos los checkpoints
+    disponibles para el equipo, ordenados por fase ascendente.
+
+    Si phase_id no es None, devuelve solo ese checkpoint concreto
+    (lista vacía si no existe).
     """
-    if phase_id is not None:
-        p = ckpt_dir / f"model_team{team_id}_phase{phase_id}.zip"
+    found: List[Tuple[int, Path]] = []
+
+    phases = (
+        [CURRICULUM[phase_id]]
+        if phase_id is not None
+        else CURRICULUM
+    )
+
+    for phase in phases:
+        p = ckpt_dir / f"model_team{team_id}_phase{phase.idx}.zip"
         if p.exists():
-            return phase_id, p
-        print(f"  [SKIP] No se encontró: {p}")
-        return None
-    return _find_best_checkpoint(ckpt_dir, team_id)
+            found.append((phase.idx, p))
+
+    return found
 
 
 # ──────────────────────────────────────────────────────────────
@@ -359,18 +350,19 @@ def generate_video(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Genera vídeos MP4 a partir de checkpoints PPO (todos los equipos)."
+        description=(
+            "Genera vídeos MP4 a partir de checkpoints PPO. "
+            "Por defecto genera un vídeo por CADA checkpoint disponible "
+            "(todos los equipos × todas las fases entrenadas)."
+        )
     )
     parser.add_argument(
         "--team", type=int, default=None,
-        help="ID de equipo concreto (1-10). Si se omite, genera para todos.",
+        help="Filtrar por equipo concreto (1-10). Si se omite, procesa todos.",
     )
     parser.add_argument(
         "--phase", type=int, default=None,
-        help=(
-            "ID de fase concreto (0-5). "
-            "Si se omite, usa el checkpoint más avanzado disponible."
-        ),
+        help="Filtrar por fase concreta (0-5). Si se omite, procesa todas las fases disponibles.",
     )
     parser.add_argument(
         "--ckpt_dir", type=str, default="checkpoints_sb3",
@@ -393,32 +385,34 @@ def main():
     ckpt_dir = Path(args.ckpt_dir)
     out_dir  = Path(args.out_dir)
 
-    # Qué equipos procesar
     team_ids: List[int] = (
         [args.team] if args.team is not None else list(TEAMS.keys())
     )
+
+    # Descubrir todos los checkpoints a procesar
+    work: List[Tuple[int, int, Path]] = []   # (team_id, phase_id, ckpt_path)
+    for tid in team_ids:
+        found = _find_all_checkpoints(ckpt_dir, tid, args.phase)
+        for phase_id, ckpt_path in found:
+            work.append((tid, phase_id, ckpt_path))
 
     print(f"\n{'='*60}")
     print(f"  GENERADOR DE VÍDEOS — MARL Exploración 3D")
     print(f"  Checkpoints : {ckpt_dir.resolve()}")
     print(f"  Salida      : {out_dir.resolve()}")
-    print(f"  Equipos     : {team_ids}")
-    print(f"  Fase fijada : {args.phase if args.phase is not None else 'mejor disponible'}")
+    print(f"  Vídeos a generar: {len(work)}")
+    for tid, pid, cp in work:
+        print(f"    equipo {tid} ({TEAMS[tid].name}) — fase {pid}  →  {cp.name}")
+    if not work:
+        print("  [!] No se encontró ningún checkpoint. Entrena primero con entrenar.py")
     print(f"{'='*60}\n")
 
     generated: List[Path] = []
-    skipped:   List[int]  = []
+    errors:    List[str]  = []
 
-    for tid in team_ids:
-        result = _find_checkpoint(ckpt_dir, tid, args.phase)
-        if result is None:
-            print(f"  [SKIP] Equipo {tid}: sin checkpoint en {ckpt_dir}")
-            skipped.append(tid)
-            continue
-
-        phase_id, ckpt_path = result
+    for i, (tid, phase_id, ckpt_path) in enumerate(work, 1):
         out_path = out_dir / f"team{tid}_{TEAMS[tid].name}_phase{phase_id}.mp4"
-
+        print(f"[{i}/{len(work)}] Equipo {tid} — Fase {phase_id}")
         try:
             generate_video(
                 team_id   = tid,
@@ -430,9 +424,10 @@ def main():
             )
             generated.append(out_path)
         except Exception as exc:
-            print(f"\n  [ERROR] Equipo {tid} falló: {exc}")
+            msg = f"Equipo {tid} / Fase {phase_id}: {exc}"
+            print(f"\n  [ERROR] {msg}")
             import traceback; traceback.print_exc()
-            skipped.append(tid)
+            errors.append(msg)
 
     # Resumen final
     print(f"\n{'='*60}")
@@ -440,8 +435,10 @@ def main():
     print(f"  Generados : {len(generated)}")
     for p in generated:
         print(f"    ✓ {p}")
-    if skipped:
-        print(f"  Sin vídeo : {skipped}")
+    if errors:
+        print(f"  Errores   : {len(errors)}")
+        for e in errors:
+            print(f"    ✗ {e}")
     print(f"{'='*60}\n")
 
 
