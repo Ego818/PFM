@@ -51,4 +51,4 @@ if __name__ == "__main__":
 
     # entrenar los 10 equipos en paralelo
     with Pool(processes=10) as pool:
-        pool.map(train, range(1, 11))
+        pool.map(train, range(6, 11))

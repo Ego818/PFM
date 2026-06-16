@@ -290,7 +290,7 @@ CURRICULUM: List[CurriculumPhase] = [
         wall_density=0.18, n_stairs=3,
         redundancy_penalty=0.0,
         completion_bonus=500.0,
-        advance_cov=0.80,
+        advance_cov=0.70,
         advance_k=10,
     ),
     CurriculumPhase(
@@ -301,7 +301,7 @@ CURRICULUM: List[CurriculumPhase] = [
         wall_density=0.18, n_stairs=5,
         redundancy_penalty=0.3,
         completion_bonus=1500.0,
-        advance_cov=0.75,
+        advance_cov=0.65,
         advance_k=5,
     ),
     CurriculumPhase(
@@ -312,7 +312,7 @@ CURRICULUM: List[CurriculumPhase] = [
         wall_density=0.30, n_stairs=8,
         redundancy_penalty=0.7,
         completion_bonus=2500.0,
-        advance_cov=0.70,
+        advance_cov=0.60,
         advance_k=8,
     ),
     CurriculumPhase(
@@ -323,7 +323,7 @@ CURRICULUM: List[CurriculumPhase] = [
         wall_density=0.33, n_stairs=10,
         redundancy_penalty=1.0,
         completion_bonus=4000.0,
-        advance_cov=0.65,
+        advance_cov=0.55,
         advance_k=20,
     ),
     CurriculumPhase(
@@ -334,7 +334,7 @@ CURRICULUM: List[CurriculumPhase] = [
         wall_density=0.33, n_stairs=10,
         redundancy_penalty=1.0,
         completion_bonus=4000.0,
-        advance_cov=0.60,
+        advance_cov=0.50,
         advance_k=20,
     ),
     CurriculumPhase(
@@ -345,7 +345,7 @@ CURRICULUM: List[CurriculumPhase] = [
         wall_density=0.33, n_stairs=10,
         redundancy_penalty=1.0,
         completion_bonus=4000.0,
-        advance_cov=0.80,
+        advance_cov=0.40,
         advance_k=20,
     ),
 ]

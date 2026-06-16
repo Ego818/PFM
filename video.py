@@ -1,13 +1,24 @@
+from __future__ import annotations
 """
 video.py  —  Generación de vídeos MP4 para todos los equipos / fases
 =====================================================================
 
-Recorre todos los TeamConfig definidos en agente_info.py, busca el
-checkpoint más avanzado disponible en checkpoints_sb3/ y genera un
-vídeo MP4 por cada equipo encontrado.
+Recorre todos los TeamConfig definidos en agente_info.py, busca los
+checkpoints disponibles en checkpoints_sb3/ y genera un vídeo MP4 por
+cada equipo/fase encontrado.
 
-El frame renderiza TODOS los pisos del mapa de MARLExploration3D
-apilados verticalmente, con los agentes dibujados en su piso real.
+ARQUITECTURA MULTI-POLÍTICA (compatible con entrenar2.py / entrenar.py v3)
+---------------------------------------------------------------------------
+Cada arquetipo único del equipo tiene su propio modelo PPO:
+    checkpoints_sb3/model_team{T}_phase{P}_arch{A}.zip
+
+En cada paso de inferencia se consulta el modelo del arquetipo
+correspondiente a cada agente y se combinan las acciones antes de
+llamar a env.step().
+
+Si sólo existe un fichero sin sufijo _arch (legado de versiones anteriores):
+    checkpoints_sb3/model_team{T}_phase{P}.zip
+se carga como modelo único compartido por todos los agentes (modo legado).
 
 USO
 ---
@@ -19,66 +30,62 @@ USO
 
 # Especificar directorio de checkpoints y salida
     python video.py --ckpt_dir checkpoints_sb3 --out_dir videos
-
-ESTRUCTURA DE CHECKPOINT ESPERADA
-----------------------------------
-    checkpoints_sb3/model_team{TEAM_ID}_phase{PHASE_ID}.zip
 """
-
-from __future__ import annotations
 
 import argparse
 import os
 import sys
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import cv2
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 from stable_baselines3 import PPO
 
 sys.path.insert(0, ".")
 from agente_info import ARCHETYPES, CURRICULUM, TEAMS, TeamConfig
-from entrenar import SB3MultiAgentVecEnv, _build_env
+from entrenar2 import _build_env, ArchetypeVecEnv
 from marl_exploration_3d import MARLExploration3D
+from visualizar_exploracion import ExplorationVisualizer
+
 
 # ──────────────────────────────────────────────────────────────
 # PARÁMETROS VISUALES
 # ──────────────────────────────────────────────────────────────
 
-CELL_SIZE   = 6          # píxeles por celda
-FPS         = 20         # fotogramas por segundo
-FLOOR_GAP   = 12         # píxeles de separación entre pisos
-PANEL_H     = 120        # altura del panel de info (parte superior)
-MAX_STEPS   = 20_000     # límite de seguridad de frames por vídeo
+CELL_SIZE         = 6
+FPS               = 20
+FLOOR_GAP         = 12
+PANEL_H           = 120
+MAX_STEPS         = 20_000
 
-# Colores BGR
-COLOR_WALL      = (30,  30,  30)
-COLOR_FREE      = (210, 210, 210)
-COLOR_VISITED   = (40,  160,  40)
-COLOR_STAIR_UP  = (200, 180,  50)
-COLOR_STAIR_DN  = (50,  130, 200)
-COLOR_BG        = (15,  15,  15)   # fondo del panel de info
-COLOR_TEXT      = (230, 230, 230)
-COLOR_TITLE     = (255, 220,  80)
-COLOR_PROGRESS  = (60,  200,  60)
-COLOR_PROGRESS_BG = (60, 60,  60)
+COLOR_WALL        = (30,  30,  30)
+COLOR_FREE        = (210, 210, 210)
+COLOR_VISITED     = (40,  160,  40)
+COLOR_STAIR_UP    = (200, 180,  50)
+COLOR_STAIR_DN    = (50,  130, 200)
+COLOR_BG          = (15,  15,  15)
+COLOR_TEXT        = (230, 230, 230)
+COLOR_TITLE       = (255, 220,  80)
+COLOR_PROGRESS    = (60,  200,  60)
+COLOR_PROGRESS_BG = (60,  60,  60)
 
-# Un color distinto por agente (hasta 10)
 AGENT_COLORS: List[Tuple[int, int, int]] = [
-    (0,   50,  255),   # azul
-    (0,  200,   50),   # verde
-    (220,  0,    0),   # rojo
-    (200, 160,   0),   # amarillo
-    (180,   0,  220),  # violeta
-    (0,  200,  200),   # cian
-    (255, 100,   0),   # naranja
-    (0,  180,  255),   # celeste
-    (255,   0,  160),  # rosa
-    (120, 255,   0),   # lima
+    (0,   50,  255),
+    (0,  200,   50),
+    (220,   0,   0),
+    (200, 160,   0),
+    (180,   0,  220),
+    (0,  200,  200),
+    (255, 100,   0),
+    (0,  180,  255),
+    (255,   0,  160),
+    (120, 255,   0),
 ]
 
-# Tipos de celda según marl_exploration_3d.py
 LIBRE          = 0
 PARED          = 1
 ESCALERA_SUBIR = 2
@@ -86,240 +93,234 @@ ESCALERA_BAJAR = 3
 
 
 # ──────────────────────────────────────────────────────────────
-# BÚSQUEDA DE CHECKPOINTS
+# BÚSQUEDA DE CHECKPOINTS  (multi-política)
 # ──────────────────────────────────────────────────────────────
+
+def _find_arch_checkpoints(
+    ckpt_dir: Path,
+    team_id:  int,
+    phase_id: int,
+) -> Optional[Dict[int, Path]]:
+    """
+    Busca los checkpoints por arquetipo para un equipo/fase.
+
+    Devuelve un dict {arch_id: path} si se encuentran TODOS los
+    arquetipos únicos del equipo, o None si falta alguno.
+
+    Modo legado: si no existen archivos _arch pero sí existe el .zip
+    sin sufijo, devuelve {-1: path} como señal de modo legado.
+    """
+    team         = TEAMS[team_id]
+    unique_archs = team.unique_archetypes()
+
+    result: Dict[int, Path] = {}
+    for arch_id in unique_archs:
+        p = ckpt_dir / f"model_team{team_id}_phase{phase_id}_arch{arch_id}.zip"
+        if p.exists():
+            result[arch_id] = p
+
+    if len(result) == len(unique_archs):
+        return result  # todos los arquetipos presentes
+
+    # Fallback: checkpoint legado sin sufijo _arch
+    legacy = ckpt_dir / f"model_team{team_id}_phase{phase_id}.zip"
+    if legacy.exists():
+        return {-1: legacy}
+
+    return None
+
 
 def _find_all_checkpoints(
     ckpt_dir: Path,
     team_id:  int,
     phase_id: Optional[int] = None,
-) -> List[Tuple[int, Path]]:
+) -> List[Tuple[int, Dict[int, Path]]]:
     """
-    Devuelve la lista de (phase_idx, path) de todos los checkpoints
-    disponibles para el equipo, ordenados por fase ascendente.
-
-    Si phase_id no es None, devuelve solo ese checkpoint concreto
-    (lista vacía si no existe).
+    Devuelve lista de (phase_idx, arch_paths_dict) para el equipo dado.
+    Si phase_id no es None, filtra solo esa fase.
     """
-    found: List[Tuple[int, Path]] = []
-
-    phases = (
-        [CURRICULUM[phase_id]]
-        if phase_id is not None
-        else CURRICULUM
-    )
-
+    phases = [CURRICULUM[phase_id]] if phase_id is not None else CURRICULUM
+    found: List[Tuple[int, Dict[int, Path]]] = []
     for phase in phases:
-        p = ckpt_dir / f"model_team{team_id}_phase{phase.idx}.zip"
-        if p.exists():
-            found.append((phase.idx, p))
-
+        arch_paths = _find_arch_checkpoints(ckpt_dir, team_id, phase.idx)
+        if arch_paths is not None:
+            found.append((phase.idx, arch_paths))
     return found
 
 
 # ──────────────────────────────────────────────────────────────
-# RENDERIZADO DE FRAME
+# INFERENCIA MULTI-POLÍTICA
 # ──────────────────────────────────────────────────────────────
 
-def _render_map(env: MARLExploration3D, cell: int) -> np.ndarray:
-    """
-    Devuelve una imagen BGR con todos los pisos apilados verticalmente.
-    Cada celda ocupa `cell`×`cell` píxeles.
-    Escaleras, celdas visitadas y agentes se pintan encima.
-    """
-    F, H, W = env.F, env.H, env.W
-    img_h = F * H * cell + (F - 1) * FLOOR_GAP
-    img_w = W * cell
-    img   = np.full((img_h, img_w, 3), COLOR_FREE, dtype=np.uint8)
-
-    for f in range(F):
-        y_off = f * (H * cell + FLOOR_GAP)
-        grid    = env.floors[f]       # (H, W) int32
-        visited = env.visited[f]      # (H, W) bool
-
-        # ── Pintar celdas ──────────────────────────────────────
-        for r in range(H):
-            for c in range(W):
-                y0 = y_off + r * cell
-                y1 = y0 + cell
-                x0 = c * cell
-                x1 = x0 + cell
-                cell_type = int(grid[r, c])
-
-                if cell_type == PARED:
-                    color = COLOR_WALL
-                elif visited[r, c]:
-                    color = COLOR_VISITED
-                elif cell_type == ESCALERA_SUBIR:
-                    color = COLOR_STAIR_UP
-                elif cell_type == ESCALERA_BAJAR:
-                    color = COLOR_STAIR_DN
-                else:
-                    color = COLOR_FREE
-
-                img[y0:y1, x0:x1] = color
-
-        # ── Etiqueta de piso ──────────────────────────────────
-        cv2.putText(
-            img,
-            f"P{f}",
-            (4, y_off + 14),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.4,
-            (80, 80, 80),
-            1,
-            cv2.LINE_AA,
-        )
-
-    # ── Dibujar agentes ───────────────────────────────────────
-    for i in range(env.n_agents):
-        f  = int(env.agent_f[i])
-        r  = int(env.agent_r[i])
-        c  = int(env.agent_c[i])
-        y_off = f * (H * cell + FLOOR_GAP)
-        y0 = y_off + r * cell
-        y1 = y0 + cell
-        x0 = c * cell
-        x1 = x0 + cell
-        color = AGENT_COLORS[i % len(AGENT_COLORS)]
-        # Círculo centrado en la celda
-        cx = (x0 + x1) // 2
-        cy = (y0 + y1) // 2
-        radius = max(1, cell // 2 - 1)
-        cv2.circle(img, (cx, cy), radius, color, -1)
-
-    return img
-
-
-def _render_panel(
-    env:        MARLExploration3D,
-    team:       TeamConfig,
-    phase_name: str,
-    step:       int,
-    panel_w:    int,
+def _predict_all(
+    models:        Dict[int, PPO],
+    vec_envs:      Dict[int, ArchetypeVecEnv],
+    arch_to_agents: Dict[int, List[int]],
+    n_agents:      int,
 ) -> np.ndarray:
-    """Panel de información superior (fondo oscuro)."""
-    panel = np.full((PANEL_H, panel_w, 3), COLOR_BG, dtype=np.uint8)
-
-    cov     = env.coverage_ratio * 100
-    visited = env._cells_visited
-    total   = env._n_free
-
-    # ── Título ────────────────────────────────────────────────
-    title = f"Equipo {team.id}: {team.name}  {team.label}  |  Fase: {phase_name}"
-    cv2.putText(panel, title, (10, 22),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_TITLE, 1, cv2.LINE_AA)
-
-    # ── Composición de arquetipos ──────────────────────────────
-    arch_str = "  ".join(
-        f"[A{aid}:{ARCHETYPES[aid].name}]" for aid in team.unique_archetypes()
-    )
-    cv2.putText(panel, arch_str, (10, 46),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, COLOR_TEXT, 1, cv2.LINE_AA)
-
-    # ── Métricas ──────────────────────────────────────────────
-    metrics = (
-        f"Paso: {step:>6d}   "
-        f"Cobertura: {cov:5.1f}%   "
-        f"Visitadas: {visited:,} / {total:,}   "
-        f"Agentes: {env.n_agents}"
-    )
-    cv2.putText(panel, metrics, (10, 70),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLOR_TEXT, 1, cv2.LINE_AA)
-
-    # ── Leyenda de agentes ────────────────────────────────────
-    x_leg = 10
-    for i in range(env.n_agents):
-        color = AGENT_COLORS[i % len(AGENT_COLORS)]
-        cv2.circle(panel, (x_leg + 8, 90), 7, color, -1)
-        aid   = team.composition[i]
-        label = f"A{i}:{ARCHETYPES[aid].name[:4]}"
-        cv2.putText(panel, label, (x_leg + 18, 95),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, color, 1, cv2.LINE_AA)
-        x_leg += 90
-
-    # ── Barra de progreso ─────────────────────────────────────
-    bar_x, bar_y, bar_w, bar_h = 10, 106, panel_w - 20, 8
-    cv2.rectangle(panel, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h),
-                  COLOR_PROGRESS_BG, -1)
-    filled = int(bar_w * env.coverage_ratio)
-    if filled > 0:
-        cv2.rectangle(panel, (bar_x, bar_y), (bar_x + filled, bar_y + bar_h),
-                      COLOR_PROGRESS, -1)
-
-    return panel
+    """
+    Recolecta acciones de todos los modelos (uno por arquetipo) y las
+    combina en un único array de longitud n_agents.
+    """
+    actions = np.zeros(n_agents, dtype=np.int64)
+    for arch_id, model in models.items():
+        vec_env      = vec_envs[arch_id]
+        agent_indices = arch_to_agents[arch_id]
+        obs          = vec_env.get_obs()           # (n_arch_agents, obs_dim)
+        acts, _      = model.predict(obs, deterministic=True)
+        for local_i, global_i in enumerate(agent_indices):
+            actions[global_i] = int(acts[local_i])
+    return actions
 
 
 # ──────────────────────────────────────────────────────────────
-# GENERACIÓN DE VÍDEO PARA UN EQUIPO
+# GENERACIÓN DE VÍDEO PARA UN EQUIPO/FASE
 # ──────────────────────────────────────────────────────────────
 
 def generate_video(
     team_id:    int,
     phase_id:   int,
-    ckpt_path:  Path,
+    arch_paths: Dict[int, Path],
     out_path:   Path,
     cell:       int = CELL_SIZE,
     fps:        int = FPS,
 ) -> None:
-    """Genera el vídeo MP4 para un equipo+fase con el modelo PPO guardado."""
+    """
+    Genera el vídeo MP4 para un equipo+fase.
 
+    arch_paths: dict {arch_id: ckpt_path} (multi-política)
+                o    {-1: ckpt_path}      (modo legado, un solo modelo)
+    """
     phase = CURRICULUM[phase_id]
     team  = TEAMS[team_id]
 
     print(f"\n{'─'*60}")
     print(f"  Equipo {team_id}: {team.name}  |  Fase {phase_id}: {phase.name}")
     print(f"  Mapa: {phase.grid_h}×{phase.grid_w}×{phase.n_floors}")
-    print(f"  Checkpoint: {ckpt_path}")
-    print(f"  Salida    : {out_path}")
+    for aid, p in arch_paths.items():
+        label = "legado" if aid == -1 else f"arquetipo {aid} ({ARCHETYPES[aid].name})"
+        print(f"  Checkpoint [{label}]: {p}")
+    print(f"  Salida: {out_path}")
     print(f"{'─'*60}")
 
-    # Construir entorno igual que en entrenar.py
-    base_env, dominant_id = _build_env(phase=phase, team_id=team_id)
-    vec_env = SB3MultiAgentVecEnv(base_env, dominant_id)
+    # ── Construir entorno base ──────────────────────────────────
+    base_env, dominant_arch_id = _build_env(phase=phase, team_id=team_id)
 
-    # Cargar modelo
-    model = PPO.load(str(ckpt_path), env=vec_env)
+    # ── Decidir modo: multi-política o legado ───────────────────
+    legacy_mode = (-1 in arch_paths)
 
-    # Primera observación
-    obs = vec_env.reset()
+    if legacy_mode:
+        # Modo legado: un único VecEnv con todos los agentes
+        vec_env_legacy = ArchetypeVecEnv(
+            env           = base_env,
+            archetype_id  = dominant_arch_id,
+            agent_indices = list(range(team.n_agents)),
+            obs_dict_init = dict(enumerate(
+                base_env.reset()[0].values()
+                if hasattr(base_env.reset()[0], "values")
+                else {i: v for i, v in enumerate(base_env.reset()[0])}
+            )),
+        )
+        model_legacy = PPO.load(str(arch_paths[-1]), env=vec_env_legacy)
+        obs_legacy   = vec_env_legacy.reset()
+        models      = None
+        vec_envs    = None
+        arch_to_agents = None
+    else:
+        # Multi-política: un VecEnv + PPO por arquetipo
+        obs_dict_init, _ = base_env.reset()
 
-    # Calcular dimensiones del frame
-    F, H, W  = base_env.F, base_env.H, base_env.W
-    map_h    = F * H * cell + (F - 1) * FLOOR_GAP
-    map_w    = W * cell
-    frame_h  = PANEL_H + map_h
-    frame_w  = map_w
+        arch_to_agents: Dict[int, List[int]] = {}
+        for agent_idx, arch_id in enumerate(team.composition):
+            arch_to_agents.setdefault(arch_id, []).append(agent_idx)
 
-    # Writer de vídeo
+        vec_envs: Dict[int, ArchetypeVecEnv] = {}
+        models:   Dict[int, PPO]             = {}
+
+        for arch_id, agent_indices in arch_to_agents.items():
+            vec_env = ArchetypeVecEnv(
+                env           = base_env,
+                archetype_id  = arch_id,
+                agent_indices = agent_indices,
+                obs_dict_init = obs_dict_init,
+            )
+            model = PPO.load(str(arch_paths[arch_id]), env=vec_env)
+            vec_envs[arch_id] = vec_env
+            models[arch_id]   = model
+
+    # ── Configurar visualizador ─────────────────────────────────
+    viz = ExplorationVisualizer(base_env)
+    viz.reset()
+    viz.fig.canvas.draw()
+
+    h = viz.fig.canvas.get_width_height()[1]
+    w = viz.fig.canvas.get_width_height()[0]
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
     writer = cv2.VideoWriter(
         str(out_path),
         cv2.VideoWriter_fourcc(*"mp4v"),
         fps,
-        (frame_w, frame_h),
+        (w, h),
     )
 
     if not writer.isOpened():
         print(f"  [ERROR] No se pudo abrir el VideoWriter para {out_path}")
-        vec_env.close()
+        base_env.close()
         return
 
-    step    = 0
-    done    = False
+    step = 0
+    done = False
 
     while not done and step < MAX_STEPS:
-        # ── Renderizar frame ──────────────────────────────────
-        map_img   = _render_map(base_env, cell)
-        panel_img = _render_panel(base_env, team, phase.name, step, frame_w)
-
-        frame = np.vstack([panel_img, map_img])
+        # ── Renderizar frame ────────────────────────────────────
+        viz.info = {
+            "coverage_ratio": base_env.coverage_ratio,
+            "cells_visited":  base_env._cells_visited,
+            "cells_total":    base_env._n_free,
+        }
+        viz._update_draw()
+        viz.fig.canvas.draw()
+        frame = np.asarray(viz.fig.canvas.buffer_rgba())[:, :, :3]
+        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
         writer.write(frame)
 
-        # ── Paso del modelo ───────────────────────────────────
-        actions, _ = model.predict(obs, deterministic=True)
-        obs, _, dones, _ = vec_env.step(actions)
-        done = bool(np.any(dones))
+        # ── Inferencia y paso ───────────────────────────────────
+        if legacy_mode:
+            actions_arr, _ = model_legacy.predict(obs_legacy, deterministic=True)
+            # step() espera dict {agent_id: action}
+            actions_dict = {i: int(a) for i, a in enumerate(actions_arr)}
+            obs_dict_next, rewards, terminated, truncated, info = base_env.step(actions_dict)
+            done_env = terminated or truncated
+            if done_env:
+                obs_dict_next, _ = base_env.reset()
+            # Convertir obs_dict a array para el siguiente predict
+            obs_legacy = np.array(
+                [obs_dict_next[i] for i in range(team.n_agents)], dtype=np.float32
+            )
+            done = done_env
+        else:
+            # Recolectar acciones de cada modelo
+            actions_dict: Dict[int, int] = {}
+            for arch_id, model in models.items():
+                vec_env      = vec_envs[arch_id]
+                agent_indices = arch_to_agents[arch_id]
+                obs          = vec_env.get_obs()
+                acts, _      = model.predict(obs, deterministic=True)
+                for local_i, global_i in enumerate(agent_indices):
+                    actions_dict[global_i] = int(acts[local_i])
+
+            obs_dict_next, rewards, terminated, truncated, info = base_env.step(actions_dict)
+            done_env = terminated or truncated
+            if done_env:
+                obs_dict_next, _ = base_env.reset()
+
+            # Distribuir obs a cada ArchetypeVecEnv
+            for arch_id, vec_env in vec_envs.items():
+                vec_env.ingest_step(obs_dict_next, rewards, done_env, info)
+
+            done = done_env
+
         step += 1
 
         if step % 500 == 0:
@@ -329,14 +330,21 @@ def generate_video(
                 f"visited={base_env._cells_visited:,}/{base_env._n_free:,}"
             )
 
-    # Frame final
-    map_img   = _render_map(base_env, cell)
-    panel_img = _render_panel(base_env, team, phase.name, step, frame_w)
-    frame = np.vstack([panel_img, map_img])
+    # ── Frame final ─────────────────────────────────────────────
+    viz.info = {
+        "coverage_ratio": base_env.coverage_ratio,
+        "cells_visited":  base_env._cells_visited,
+        "cells_total":    base_env._n_free,
+    }
+    viz._update_draw()
+    viz.fig.canvas.draw()
+    frame = np.asarray(viz.fig.canvas.buffer_rgba())[:, :, :3]
+    frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
     writer.write(frame)
 
     writer.release()
-    vec_env.close()
+    plt.close(viz.fig)
+    base_env.close()
 
     print(
         f"\n  ✓ Vídeo guardado: {out_path}"
@@ -351,9 +359,8 @@ def generate_video(
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "Genera vídeos MP4 a partir de checkpoints PPO. "
-            "Por defecto genera un vídeo por CADA checkpoint disponible "
-            "(todos los equipos × todas las fases entrenadas)."
+            "Genera vídeos MP4 a partir de checkpoints PPO (multi-política). "
+            "Por defecto genera un vídeo por cada checkpoint disponible."
         )
     )
     parser.add_argument(
@@ -389,20 +396,20 @@ def main():
         [args.team] if args.team is not None else list(TEAMS.keys())
     )
 
-    # Descubrir todos los checkpoints a procesar
-    work: List[Tuple[int, int, Path]] = []   # (team_id, phase_id, ckpt_path)
+    # Descubrir todos los checkpoints
+    work: List[Tuple[int, int, Dict[int, Path]]] = []
     for tid in team_ids:
-        found = _find_all_checkpoints(ckpt_dir, tid, args.phase)
-        for phase_id, ckpt_path in found:
-            work.append((tid, phase_id, ckpt_path))
+        for phase_id, arch_paths in _find_all_checkpoints(ckpt_dir, tid, args.phase):
+            work.append((tid, phase_id, arch_paths))
 
     print(f"\n{'='*60}")
-    print(f"  GENERADOR DE VÍDEOS — MARL Exploración 3D")
+    print(f"  GENERADOR DE VÍDEOS — MARL Exploración 3D (multi-política)")
     print(f"  Checkpoints : {ckpt_dir.resolve()}")
     print(f"  Salida      : {out_dir.resolve()}")
     print(f"  Vídeos a generar: {len(work)}")
-    for tid, pid, cp in work:
-        print(f"    equipo {tid} ({TEAMS[tid].name}) — fase {pid}  →  {cp.name}")
+    for tid, pid, ap in work:
+        mode = "legado" if -1 in ap else f"{len(ap)} arquetipo(s)"
+        print(f"    equipo {tid} ({TEAMS[tid].name}) — fase {pid}  [{mode}]")
     if not work:
         print("  [!] No se encontró ningún checkpoint. Entrena primero con entrenar.py")
     print(f"{'='*60}\n")
@@ -410,17 +417,17 @@ def main():
     generated: List[Path] = []
     errors:    List[str]  = []
 
-    for i, (tid, phase_id, ckpt_path) in enumerate(work, 1):
+    for i, (tid, phase_id, arch_paths) in enumerate(work, 1):
         out_path = out_dir / f"team{tid}_{TEAMS[tid].name}_phase{phase_id}.mp4"
         print(f"[{i}/{len(work)}] Equipo {tid} — Fase {phase_id}")
         try:
             generate_video(
-                team_id   = tid,
-                phase_id  = phase_id,
-                ckpt_path = ckpt_path,
-                out_path  = out_path,
-                cell      = args.cell,
-                fps       = args.fps,
+                team_id    = tid,
+                phase_id   = phase_id,
+                arch_paths = arch_paths,
+                out_path   = out_path,
+                cell       = args.cell,
+                fps        = args.fps,
             )
             generated.append(out_path)
         except Exception as exc:
@@ -429,7 +436,6 @@ def main():
             import traceback; traceback.print_exc()
             errors.append(msg)
 
-    # Resumen final
     print(f"\n{'='*60}")
     print(f"  RESUMEN")
     print(f"  Generados : {len(generated)}")
