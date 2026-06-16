@@ -271,7 +271,8 @@ def generate_video(
 
     step = 0
     done = False
-
+    pasos_sin_novedad = 0
+    ultimo_conteo_descubiertas = base_env._cells_visited
     while not done and step < MAX_STEPS:
         # ── Renderizar frame ────────────────────────────────────
         viz.info = {
@@ -322,7 +323,26 @@ def generate_video(
             done = done_env
 
         step += 1
+        actual_descubiertas = base_env._cells_visited
+        if actual_descubiertas > ultimo_conteo_descubiertas:
+            pasos_sin_novedad = 0  # Se reinicia el contador al encontrar novedad
+            ultimo_conteo_descubiertas = actual_descubiertas
+        else:
+            pasos_sin_novedad += 1  # No se avanzó en exploración
 
+        if pasos_sin_novedad >= 1000:
+            print(
+                f"    [INFO] Parada por estancamiento: step={step:<6d} "
+                f"Llevaba {pasos_sin_novedad} pasos sin descubrir casillas nuevas."
+            )
+            break
+
+        if step % 500 == 0:
+            print(
+                f"    step={step:>6d}  "
+                f"cov={base_env.coverage_ratio*100:.1f}%  "
+                f"visited={base_env._cells_visited:,}/{base_env._n_free:,}"
+            )
         if step % 500 == 0:
             print(
                 f"    step={step:>6d}  "
